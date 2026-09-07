@@ -7587,6 +7587,8 @@ window.BACKGROUNDS = BACKGROUNDS;
   const spamRef = db.ref('spamProtection');
   const typingRef = db.ref('typing');
   const reportsRef = db.ref('reports');
+  const moderationLogRef = db.ref('moderationLog');   // журнал модерации: кто/когда/за что
+  const reporterActivityRef = db.ref('reporterActivity'); // недавние жалобы каждого пользователя — для защиты от серийных жалобщиков
 
   // ===== ГЛОБАЛЬНЫЕ ПЕРЕМЕННЫЕ =====
   const uid = (function getUserId() {
@@ -7953,7 +7955,14 @@ window.BACKGROUNDS = BACKGROUNDS;
     if (data.bannedUntil && data.bannedUntil > Date.now()) return true;
     return false;
   }
-  async function applyBanTo(targetUid) {
+  // Журнал модерации: пишем каждое действие (бан, удаление) с указанием
+  // кого, когда и за что — чтобы потом можно было разобрать спорные
+  // случаи и найти лазейки в фильтре, а не гадать задним числом.
+  function logModeration(entry) {
+    moderationLogRef.push({ ...entry, timestamp: Date.now() }).catch(() => {});
+  }
+
+  async function applyBanTo(targetUid, reason) {
     const banRef = bansRef.child(targetUid);
     const snap = await banRef.once('value');
     let data = snap.val() || { count: 0, permanent: false, bannedUntil: 0 };
@@ -7962,8 +7971,33 @@ window.BACKGROUNDS = BACKGROUNDS;
     else if (data.count === 1) data.bannedUntil = Date.now() + 5*60*1000;
     else if (data.count === 2) data.bannedUntil = Date.now() + 5*24*60*60*1000;
     await banRef.set(data);
+    logModeration({
+      action: 'ban',
+      targetUid,
+      strikeCount: data.count,
+      permanent: !!data.permanent,
+      reason: reason || 'unspecified'
+    });
   }
-  async function applyBan() { return applyBanTo(uid); }
+  async function applyBan() { return applyBanTo(uid, 'own_message_flagged_on_send'); }
+
+  // Защита от серийных жалобщиков: если один и тот же человек подал много
+  // жалоб за короткое время, его СЛЕДУЮЩИЕ жалобы временно не учитываются
+  // в счётчике порога (но сама жалоба всё равно фиксируется — не тайно
+  // отбрасывается, просто не засчитывается, пока активность не уляжется).
+  const REPORTER_WINDOW_MS = 10 * 60 * 1000;   // окно наблюдения — 10 минут
+  const REPORTER_THROTTLE_AFTER = 5;           // после 5 жалоб за окно — следующие не считаются
+  async function isReporterThrottled(reporterUid) {
+    const now = Date.now();
+    const activityRef = reporterActivityRef.child(reporterUid);
+    const snap = await activityRef.once('value');
+    let timestamps = snap.val() || [];
+    timestamps = timestamps.filter(t => now - t < REPORTER_WINDOW_MS);
+    const throttled = timestamps.length >= REPORTER_THROTTLE_AFTER;
+    timestamps.push(now);
+    await activityRef.set(timestamps.slice(-30)); // не храним историю бесконечно
+    return throttled;
+  }
 
   // ===== АНТИСПАМ =====
   async function isMuted() {
@@ -8014,9 +8048,14 @@ window.BACKGROUNDS = BACKGROUNDS;
       input.value = '';
       return;
     }
-    if (pfResult === 'warn') {
-      alert('Пожалуйста, будьте вежливы в чате. Сообщение не отправлено.');
-      return;
+    // 'warn' — подозрительный, но не стопроцентно однозначный случай
+    // (грубость, а не явный мат). Вместо мгновенной блокировки с явным
+    // предупреждением — теневой мут: сообщение "отправляется" как обычно,
+    // автор не замечает никакой разницы и не начинает целенаправленно
+    // подбирать обход фильтра, но остальные участники чата его не видят.
+    const isShadowMuted = pfResult === 'warn';
+    if (isShadowMuted) {
+      logModeration({ action: 'shadow_mute', targetUid: uid, reason: 'warn_severity_on_send', messageText: text });
     }
 
     let shouldDelete = false;
@@ -8032,6 +8071,7 @@ window.BACKGROUNDS = BACKGROUNDS;
       background: profile.equipped.background || 'none',
       color: profile.equipped.nickColor || '#ffffff',
       text: text,
+      shadowMuted: isShadowMuted,
       timestamp: firebase.database.ServerValue.TIMESTAMP
     };
 
@@ -8054,6 +8094,9 @@ window.BACKGROUNDS = BACKGROUNDS;
     const msg = snapshot.val();
     msg.key = snapshot.key;
     if (ignoredUsers.has(msg.uid)) return;
+    // Теневой мут: сообщение видно только самому автору — для всех
+    // остальных оно как будто не существует, автор об этом не знает
+    if (msg.shadowMuted && msg.uid !== uid) return;
     displayMessage(msg);
     // Звук, если чат не активен или вкладка скрыта
     if (chatModal.style.display !== 'flex' || document.hidden) {
@@ -8162,7 +8205,11 @@ function displayMessage(msg) {
       const existing = await reportsForMsg.child(uid).once('value');
       if (existing.exists()) return;
 
-      await reportsForMsg.child(uid).set(Date.now());
+      // Проверяем, не серийный ли это жалобщик — если да, его жалоба всё
+      // равно фиксируется (не тайно отбрасывается), но временно не идёт
+      // в счётчик порога для неоднозначных случаев ниже
+      const throttled = await isReporterThrottled(uid);
+      await reportsForMsg.child(uid).set({ time: Date.now(), throttled });
       localStorage.setItem('reported_' + key, uid);
 
       // Перепроверяем текст сообщения тем же фильтром, что и при отправке.
@@ -8176,7 +8223,8 @@ function displayMessage(msg) {
         if (severity !== 'clean') {
           await chatRef.child(key).remove();
           await reportsForMsg.remove();
-          if (msgData.uid) await applyBanTo(msgData.uid);
+          if (msgData.uid) await applyBanTo(msgData.uid, 'reported_and_filter_confirmed:' + severity);
+          logModeration({ action: 'delete_message', messageKey: key, reason: 'filter_confirmed_on_report', reportedBy: uid });
           return;
         }
       }
@@ -8184,14 +8232,16 @@ function displayMessage(msg) {
       // Если фильтр не считает сообщение оскорблением — это спорный,
       // субъективный случай (не мат, а что-то другое), и для его удаления
       // нужен более широкий консенсус, а не 1-3 человека, которые решили
-      // "задавить" кого-то жалобами. Порог поднят до 5.
+      // "задавить" кого-то жалобами. Порог поднят до 5, а жалобы серийных
+      // жалобщиков (throttled) в счётчик не идут.
       const REPORT_THRESHOLD_UNFLAGGED = 5;
       const allReports = await reportsForMsg.once('value');
       let count = 0;
-      allReports.forEach(() => count++);
+      allReports.forEach(child => { if (!child.val() || !child.val().throttled) count++; });
       if (count >= REPORT_THRESHOLD_UNFLAGGED) {
         await chatRef.child(key).remove();
         await reportsForMsg.remove();
+        logModeration({ action: 'delete_message', messageKey: key, reason: 'report_threshold_reached', reportCount: count });
       }
     } else if (action === 'ignore') {
       if (msgUid === uid) return;
@@ -8210,7 +8260,9 @@ function displayMessage(msg) {
         snapshot.forEach(child => {
           const msg = child.val();
           msg.key = child.key;
-          if (!ignoredUsers.has(msg.uid)) displayMessage(msg);
+          if (ignoredUsers.has(msg.uid)) return;
+          if (msg.shadowMuted && msg.uid !== uid) return;
+          displayMessage(msg);
         });
       });
     }
